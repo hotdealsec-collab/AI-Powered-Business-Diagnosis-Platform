@@ -225,7 +225,7 @@ def run_ai_diagnosis(prompt, context, sources_info):
     """
     
     response = llm_client.chat.completions.create(
-        model="gpt-4o", 
+        model="gpt-4o-mini", 
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
