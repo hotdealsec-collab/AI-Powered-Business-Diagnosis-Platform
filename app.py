@@ -81,7 +81,6 @@ def load_csv_smart(file_bytes):
         except Exception:
             continue
 
-    # 1. GA4 방식: '#' 기호로 시작하는 줄을 주석으로 처리하고 로드
     try:
         df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use, comment='#')
         if len(df.columns) > 2:
@@ -89,7 +88,6 @@ def load_csv_smart(file_bytes):
     except Exception:
         pass
 
-    # 2. Google Ads 방식: 위에서부터 불필요한 줄을 하나씩 건너뛰며 로드 (최대 12줄)
     for skip in range(13):
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), skiprows=skip, encoding=encoding_to_use)
@@ -102,7 +100,6 @@ def load_csv_smart(file_bytes):
     return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use), encoding_to_use
 
 def extract_date_range(df, file_bytes, encoding):
-    # 1. 표(DataFrame) 안에 날짜 컬럼이 있는지 확인 (시계열 데이터)
     date_cols = [col for col in df.columns if any(kw in str(col).lower() for kw in ['date', 'day', 'time', '週', '日', '月', '年'])]
     if date_cols:
         date_col = date_cols[0]
@@ -114,7 +111,6 @@ def extract_date_range(df, file_bytes, encoding):
         except:
             pass
             
-    # 2. 표에 날짜가 없다면 파일 메타데이터(상단 주석)에서 추출 시도 (GA4 방식)
     try:
         decoded_text = file_bytes.decode(encoding)
         start_match = re.search(r'開始日:\s*(\d{8})', decoded_text)
@@ -144,8 +140,9 @@ def prepare_data_for_ai(df):
     click_col = find_col(['クリック数', '広告のクリック数', 'clicks'], ['click', 'クリック'])
     imp_col = find_col(['表示回数', '広告の表示回数', 'impressions'], ['imp', '表示'])
     conv_col = find_col(['コンバージョン', 'キーイベント', 'conversions'], ['conv', 'コンバージョン', 'キーイベント'])
+    rev_col = find_col(['合計収益', 'revenue', 'value', '購入値'], ['収益', 'revenue', 'value'])
     
-    for col in [cost_col, click_col, imp_col, conv_col]:
+    for col in [cost_col, click_col, imp_col, conv_col, rev_col]:
         if col and col in df.columns:
             df[col] = df[col].astype(str).str.replace(',', '').str.replace('%', '')
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -156,6 +153,7 @@ def prepare_data_for_ai(df):
     if click_col: agg_dict[click_col] = 'sum'
     if imp_col: agg_dict[imp_col] = 'sum'
     if conv_col: agg_dict[conv_col] = 'sum'
+    if rev_col: agg_dict[rev_col] = 'sum'
     
     if campaign_col and agg_dict:
         camp_summary = df.groupby(campaign_col).agg(agg_dict).reset_index()
@@ -163,6 +161,11 @@ def prepare_data_for_ai(df):
             camp_summary['CPA'] = np.where(camp_summary[conv_col] > 0, (camp_summary[cost_col] / camp_summary[conv_col]).round(0), 0)
         if click_col and imp_col:
             camp_summary['CTR(%)'] = np.where(camp_summary[imp_col] > 0, ((camp_summary[click_col] / camp_summary[imp_col]) * 100).round(2), 0)
+        # 신규 추가: CVR (Conversion Rate) 자동 계산
+        if conv_col and click_col:
+            camp_summary['CVR(%)'] = np.where(camp_summary[click_col] > 0, ((camp_summary[conv_col] / camp_summary[click_col]) * 100).round(2), 0)
+        if rev_col and cost_col:
+            camp_summary['ROAS(%)'] = np.where(camp_summary[cost_col] > 0, ((camp_summary[rev_col] / camp_summary[cost_col]) * 100).round(0), 0)
             
         summary_text += "--- [Campaign Performance Summary (Aggregated)] ---\n"
         summary_text += camp_summary.to_csv(index=False) + "\n\n"
@@ -171,6 +174,10 @@ def prepare_data_for_ai(df):
         trend_summary = df.groupby(date_col).agg(agg_dict).reset_index().sort_values(by=date_col)
         if conv_col and cost_col:
             trend_summary['CPA'] = np.where(trend_summary[conv_col] > 0, (trend_summary[cost_col] / trend_summary[conv_col]).round(0), 0)
+        if conv_col and click_col:
+            trend_summary['CVR(%)'] = np.where(trend_summary[click_col] > 0, ((trend_summary[conv_col] / trend_summary[click_col]) * 100).round(2), 0)
+        if rev_col and cost_col:
+            trend_summary['ROAS(%)'] = np.where(trend_summary[cost_col] > 0, ((trend_summary[rev_col] / trend_summary[cost_col]) * 100).round(0), 0)
         summary_text += "--- [Time-series Trend Summary (Aggregated)] ---\n"
         summary_text += trend_summary.to_csv(index=False) + "\n"
         
@@ -183,25 +190,29 @@ def prepare_data_for_ai(df):
 def run_ai_diagnosis(prompt, context, sources_info):
     system_prompt = """
     당신은 7년 차 탑티어 퍼포먼스 마케터(Performance Marketer)입니다.
-    제공된 데이터(피벗 테이블)를 분석하여 광고주가 즉시 광고 시스템에 접속해 조치를 취할 수 있는 수준의 '매체 최적화 액션플랜'을 도출해야 합니다.
+    제공된 데이터(피벗 테이블)를 분석하여 광고주가 즉시 실행할 수 있는 '매체 최적화 액션플랜'을 도출해야 합니다.
 
-    [핵심 분석 룰]
-    1. 'Campaign Performance Summary'의 캠페인 이름(예: 【KP】ACe_Demandgen 등)을 반드시 정확하게 명시하여 분석하세요.
-    2. CPA가 극단적으로 높거나, 비용(Cost)은 많이 썼는데 전환(Conversion/KeyEvent)이 0인 캠페인은 "즉시 OFF 또는 예산 대폭 축소" 대상입니다.
-    3. CPA가 타겟 단가에 부합하거나 효율이 매우 좋은 캠페인은 "예산 증액(Scale-up)" 대상입니다.
-    4. 분석할 때 반드시 실제 수치(비용, CPA, 전환수 등)를 괄호나 문장 속에 포함하여 설득력을 높이세요.
-    5. 'Time-series Trend'를 보고 주차별/일자별로 매체 효율이 악화되고 있는지, 개선되고 있는지 짚어내세요 (데이터가 있을 경우만).
-    6. **반드시 마케팅 실무 용어(예: 지면 최적화, 머신러닝 안정화, 디마케팅, ROAS/CPA 한계점, 타겟팅 뎁스 등)를 자연스럽게 구사하세요.**
+    [핵심 퍼포먼스 마케팅 진단 로직]
+    1. **절대 룰 (CPA & ROAS):** CPA는 목표치보다 낮을수록 우수한 것이며, ROAS는 높을수록 우수합니다. CPA가 타겟보다 낮다면 무조건 칭찬하고 예산 증액(Scale-up)을 제안하세요.
+    2. **퍼넬 진단 (CTR vs CVR 분석):**
+       - [CTR은 높은데 CVR이 낮음]: 광고 소재(Creative)의 후킹은 좋으나, 랜딩 페이지 경험이 나쁘거나 과장 광고(Clickbait)일 확률이 높다고 진단하세요.
+       - [CTR은 낮으나 CVR이 높음]: 타겟팅이 너무 좁거나 소재 매력도가 떨어져 클릭을 못 받지만, 유입된 유저의 구매 의도는 좋다고 진단하세요. (소재 교체 제안)
+    3. **통계적 유의성 판단:** 클릭수가 100건 미만이거나 비용 소진이 미미한 캠페인은 "아직 모수가 부족하여 머신러닝 학습 중이므로 섣부른 판단 보류"라고 조언하세요.
+    4. **예산 낭비(Wasted Spend) 색출:** 모수가 충분함에도 전환(Conversions)이 없거나 CPA가 압도적으로 높은 캠페인을 반드시 집어내어 "즉시 OFF"를 권고하세요.
+    
+    [작성 규칙]
+    - 캠페인 이름을 정확히 명시하고 (예: 【KP】ACe_Demandgen), CPA/ROAS/CVR 등 괄호 안에 실제 수치를 넣어 설득력을 높이세요.
+    - '타겟팅 뎁스', '랜딩 페이지 최적화(LPO)', '머신러닝 안정화', '디마케팅' 등의 전문 용어를 구사하세요.
+    - 반드시 아래 4가지 H3(###) 마크다운 헤딩 구조를 지키고, 한국어(Korean)로만 출력하세요.
 
-    반드시 아래 4가지 H3(###) 헤딩 구조를 엄격하게 지켜서 마크다운으로 출력하세요. 절대 영어로 출력하지 마세요:
     ### 1. Executive Summary (성과 현황 요약)
-    ### 2. Key Findings (캠페인별 세부 효율 진단)
-    ### 3. Root Causes (효율 상승/하락의 데이터적 근거)
-    ### 4. Priority Actions (마케터가 지금 당장 실행해야 할 매체 최적화 액션)
+    ### 2. Key Findings (캠페인별 세부 효율 진단 - 퍼넬 관점)
+    ### 3. Root Causes (효율 상승/하락의 데이터적 원인 진단)
+    ### 4. Priority Actions (마케터가 당장 실행해야 할 예산 최적화 액션)
     """
     
     user_message = f"""
-    [데이터 요약본 (캠페인별 & 시계열)]
+    [데이터 요약본 (캠페인별 & 시계열 - CVR 및 ROAS 포함됨)]
     {sources_info}
     
     [사용자 분석 요청]
@@ -210,7 +221,7 @@ def run_ai_diagnosis(prompt, context, sources_info):
     [추가 비즈니스 컨텍스트]
     {context if context else "None"}
     
-    위 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 한국어로 작성해 주세요.
+    위 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 작성해 주세요.
     """
     
     response = llm_client.chat.completions.create(
