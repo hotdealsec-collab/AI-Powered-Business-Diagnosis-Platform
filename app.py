@@ -109,23 +109,25 @@ def prepare_data_for_ai(df):
     return df_sample.to_csv(index=False)
 
 def run_ai_diagnosis(prompt, context, sources_info):
-    """OpenAI API를 호출하여 진단 리포트를 생성합니다."""
+    """OpenAI API를 호출하여 진단 리포트를 생성합니다. (퍼포먼스 마케터 특화 버전)"""
     system_prompt = """
-    You are an expert AI Business & Performance Marketing Consultant for 'AI ONLABS'.
-    You will be provided with actual business data (in CSV format) uploaded by the user.
-    
-    CRITICAL INSTRUCTION:
-    - Do NOT talk about the file structure (e.g., "The dataset has 95 rows and 29 columns").
-    - Do NOT suggest "getting more data" as a primary action.
-    - Instead, deeply analyze the actual business metrics in the data (e.g., Cost, Clicks, Impressions, CPA, Conversions, ROAS, trends over time, campaign performance).
-    - Identify specific campaigns that are working well, and which ones are failing or spending inefficiently. Provide data-backed reasons.
-    
-    You MUST format your response strictly using these 4 exact headings (use Markdown H3 ###):
-    ### 1. Executive Summary
-    ### 2. Key Findings
-    ### 3. Root Causes
-    ### 4. Priority Actions
-    Do not add extra sections. Keep it professional, highly analytical, and actionable.
+    당신은 'AI ONLABS'의 수석 퍼포먼스 마케터(Senior Performance Marketer)이자 데이터 분석가입니다.
+    사용자가 업로드한 실제 광고/비즈니스 데이터(CSV)를 바탕으로 날카롭고 실무적인 진단 리포트를 작성해야 합니다.
+
+    [핵심 분석 지침 - CRITICAL INSTRUCTION]
+    1. 대시보드에서 볼 수 있는 단순 수치 나열(예: "A캠페인 클릭이 100건입니다")은 절대 금지합니다.
+    2. '비용(Cost)', '전환수(Conversions)', 'CPA', 'CTR', '예산(Budget)' 간의 상관관계를 심층 분석하세요.
+    3. 예산 낭비(Wasted Spend): 비용은 많이 소진되었으나 전환이 없는 캠페인을 찾아내어 즉각적인 OFF 또는 예산 축소를 권고하세요.
+    4. 스케일업(Scale-up) 기회: CPA가 타겟보다 낮으면서 볼륨(노출/클릭)이 안정적인 캠페인을 찾아 예산 증액을 제안하세요.
+    5. 정책 제한이나 스테이터스(Status) 오류가 비용 소진에 미치는 영향을 파악하세요.
+    6. 반드시 실무 퍼포먼스 마케팅 용어(예: 예산 스케일링, 매체 효율, 지면 최적화, 논타겟 트래픽, 전환 기여 등)를 사용하여 전문가처럼 작성하세요.
+    7. **모든 출력 결과는 반드시 '한국어(Korean)'로 작성해야 합니다.**
+
+    반드시 아래 4가지 H3(###) 헤딩 구조를 엄격하게 지켜서 마크다운으로 출력하세요:
+    ### 1. Executive Summary (현 상황에 대한 마케터 관점의 핵심 요약)
+    ### 2. Key Findings (데이터 기반의 주요 발견 사항 및 효율/비효율 캠페인 식별)
+    ### 3. Root Causes (수치 변화나 효율 저하의 근본적인 데이터 원인)
+    ### 4. Priority Actions (지금 당장 마케터가 광고 관리자에서 실행해야 할 구체적인 액션 아이템)
     """
     
     user_message = f"""
@@ -138,7 +140,7 @@ def run_ai_diagnosis(prompt, context, sources_info):
     [Additional Context]
     {context if context else "None"}
     
-    Based on the provided raw data timeline and context, please provide the diagnosis. Focus on the actual metric numbers.
+    위 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 한국어로 작성해 주세요.
     """
     
     response = llm_client.chat.completions.create(
@@ -150,7 +152,6 @@ def run_ai_diagnosis(prompt, context, sources_info):
         temperature=0.7
     )
     return response.choices[0].message.content
-
 # ==========================================
 # 5. View: Projects
 # ==========================================
