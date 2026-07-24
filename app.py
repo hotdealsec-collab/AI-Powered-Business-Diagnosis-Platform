@@ -7,9 +7,8 @@ from supabase import create_client, Client
 from openai import OpenAI
 
 # ==========================================
-# 1. API & DB Setup (Secrets 활용)
+# 1. API & DB Setup
 # ==========================================
-# Streamlit Secrets에서 키를 불러옵니다.
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -67,15 +66,41 @@ def navigate(page_name):
 # ==========================================
 # 4. Helper Functions (Data & AI)
 # ==========================================
+def load_csv_smart(file_bytes):
+    """Google Ads 등 메타데이터가 포함된 CSV를 자동으로 인식하고 읽어옵니다."""
+    # 1. 인코딩 감지 시도
+    encoding_to_use = 'utf-8-sig'
+    for enc in ['utf-8-sig', 'utf-8', 'shift_jis', 'cp932', 'utf-16']:
+        try:
+            file_bytes.decode(enc)
+            encoding_to_use = enc
+            break
+        except Exception:
+            continue
+
+    # 2. 메타데이터(헤더 설명)를 건너뛰며 유효한 표 형태를 찾습니다 (0~3줄 건너뛰기)
+    for skip in [2, 1, 0, 3]:
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), skiprows=skip, encoding=encoding_to_use)
+            # 열 개수가 충분히 많고, 첫 번째 열이 리포트 제목이 아니라면 정상적인 데이터로 간주
+            first_col = str(df.columns[0])
+            if len(df.columns) > 2 and 'レポート' not in first_col and 'Report' not in first_col:
+                return df
+        except Exception:
+            continue
+            
+    # 위 조건에 모두 맞지 않으면 기본값으로 로드 시도
+    return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use)
+
 def extract_date_range(df):
-    """Pandas를 이용해 날짜 컬럼을 찾고 Coverage를 계산합니다."""
-    date_cols = [col for col in df.columns if 'date' in col.lower() or 'day' in col.lower() or 'time' in col.lower()]
+    """Pandas를 이용해 날짜 컬럼을 찾고 Coverage를 계산합니다. (일본어 지원)"""
+    date_cols = [col for col in df.columns if any(kw in str(col).lower() for kw in ['date', 'day', 'time', '週', '日', '月', '年'])]
     if date_cols:
         date_col = date_cols[0]
         try:
-            df[date_col] = pd.to_datetime(df[date_col])
-            min_date = df[date_col].min().strftime('%Y-%m-%d')
-            max_date = df[date_col].max().strftime('%Y-%m-%d')
+            parsed_dates = pd.to_datetime(df[date_col], errors='coerce')
+            min_date = parsed_dates.min().strftime('%Y-%m-%d')
+            max_date = parsed_dates.max().strftime('%Y-%m-%d')
             return f"{min_date} ~ {max_date}"
         except:
             return "Unknown Coverage"
@@ -108,7 +133,7 @@ def run_ai_diagnosis(prompt, context, sources_info):
     """
     
     response = llm_client.chat.completions.create(
-        model="gpt-4o", # 보유하신 키의 권한에 따라 gpt-3.5-turbo로 변경 가능
+        model="gpt-4o", 
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
@@ -174,12 +199,18 @@ def view_workspace():
                 uploaded_file = st.file_uploader("Upload CSV Dataset", type=["csv"])
                 if st.button("Connect & Upload") and uploaded_file:
                     with st.spinner("Uploading to Supabase & Analyzing timeline..."):
-                        # 1. Pandas로 읽고 날짜 계산
-                        df = pd.read_csv(uploaded_file)
-                        coverage = extract_date_range(df)
+                        
+                        file_bytes = uploaded_file.getvalue()
+                        
+                        # 1. 스마트 로더를 통해 CSV를 깨끗한 표(DataFrame)로 가져오기
+                        try:
+                            df = load_csv_smart(file_bytes)
+                            coverage = extract_date_range(df)
+                        except Exception as e:
+                            st.error(f"데이터 파싱 에러: {e}")
+                            st.stop()
                         
                         # 2. Supabase Storage 업로드
-                        file_bytes = uploaded_file.getvalue()
                         file_name = f"{st.session_state.current_project}_{platform}_{int(time.time())}.csv"
                         try:
                             supabase.storage.from_(BUCKET_NAME).upload(file_name, file_bytes)
@@ -230,7 +261,7 @@ def view_workspace():
                 else:
                     with st.spinner("AI is diagnosing your business timeline..."):
                         # 소스 정보 텍스트화
-                        sources_info = "\\n".join([f"- {s['name']} (Coverage: {s['coverage']}, {s['data_summary']})" for s in st.session_state.sources])
+                        sources_info = "\n".join([f"- {s['name']} (Coverage: {s['coverage']}, {s['data_summary']})" for s in st.session_state.sources])
                         
                         # 실제 OpenAI API 호출
                         ai_report = run_ai_diagnosis(prompt, context, sources_info)
