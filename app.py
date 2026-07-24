@@ -1,237 +1,275 @@
-
 import streamlit as st
+import pandas as pd
 import time
+from datetime import datetime
+import io
+from supabase import create_client, Client
+from openai import OpenAI
 
 # ==========================================
-# 1. Page Configuration & CSS
+# 1. API & DB Setup (Secrets 활용)
+# ==========================================
+# Streamlit Secrets에서 키를 불러옵니다.
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    llm_client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    st.error("⚠️ Secrets 설정이 누락되었거나 잘못되었습니다. Streamlit Cloud의 Settings > Secrets를 확인해주세요.")
+    st.stop()
+
+BUCKET_NAME = "datasets-ai-powered-business-diagnosis-platform"
+
+# ==========================================
+# 2. Page Configuration & CSS
 # ==========================================
 st.set_page_config(page_title="AI ONLABS MVP", layout="wide", initial_sidebar_state="collapsed")
 
-# Custom CSS for NotebookLM-like minimalist feel
 st.markdown('''
 <style>
     header {visibility: hidden;}
     #MainMenu {visibility: hidden;}
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
+    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
     .card {
-        border: 1px solid #E5E7EB;
-        border-radius: 8px;
-        padding: 24px;
-        margin-bottom: 16px;
-        background-color: #FFFFFF;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        border: 1px solid #E5E7EB; border-radius: 8px; padding: 24px; margin-bottom: 16px;
+        background-color: #FFFFFF; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
     }
     .status-ready { color: #10B981; font-weight: 600; }
-    .status-review { color: #F59E0B; font-weight: 600; }
     .coverage-text { font-size: 0.9em; color: #6B7280; }
-    
-    /* Hide Streamlit default UI elements as much as possible */
     footer {visibility: hidden;}
 </style>
 ''', unsafe_allow_html=True)
 
 # ==========================================
-# 2. Session State Initialization
+# 3. Session State Initialization
 # ==========================================
-if 'page' not in st.session_state:
-    st.session_state.page = 'Projects'
+if 'page' not in st.session_state: st.session_state.page = 'Projects'
+if 'current_project' not in st.session_state: st.session_state.current_project = None
 
-if 'current_project' not in st.session_state:
-    st.session_state.current_project = None
-
+if 'projects' not in st.session_state:
+    st.session_state.projects = [{"name": "AJIOKA", "source_count": 0, "last_analysis": "Never"}]
 if 'sources' not in st.session_state:
-    st.session_state.sources = [
-        {"name": "Google Ads", "status": "🟢 Ready", "latest": "2026-07-24 09:35", "coverage": "2026-01-03 ~ 2026-07-24", "history": ["2026-07-24 09:35 (v4)", "2026-07-23 18:10 (v3)"]},
-        {"name": "GA4", "status": "🟡 Needs Review", "latest": "2026-07-20 14:00", "coverage": "2026-01-03 ~ 2026-07-20", "history": ["2026-07-20 14:00 (v1)"]}
-    ]
-
+    st.session_state.sources = []
 if 'archives' not in st.session_state:
-    st.session_state.archives = [
-        {"title": "Campaign Diagnosis", "date": "Jul 21", "coverage": "2026-01-03 ~ 2026-07-20", "sources": "Google Ads", "prompt": "Diagnose recent campaign drops"}
-    ]
+    st.session_state.archives = []
     
-if 'analysis_result' not in st.session_state:
-    st.session_state.analysis_result = None
-    
-if 'prompt_input' not in st.session_state:
-    st.session_state.prompt_input = ""
+if 'analysis_result' not in st.session_state: st.session_state.analysis_result = None
+if 'prompt_input' not in st.session_state: st.session_state.prompt_input = ""
+if 'show_add_source' not in st.session_state: st.session_state.show_add_source = False
 
-# ==========================================
-# 3. Navigation Helper
-# ==========================================
 def navigate(page_name):
     st.session_state.page = page_name
     st.rerun()
 
 # ==========================================
-# 4. View: Projects
+# 4. Helper Functions (Data & AI)
+# ==========================================
+def extract_date_range(df):
+    """Pandas를 이용해 날짜 컬럼을 찾고 Coverage를 계산합니다."""
+    date_cols = [col for col in df.columns if 'date' in col.lower() or 'day' in col.lower() or 'time' in col.lower()]
+    if date_cols:
+        date_col = date_cols[0]
+        try:
+            df[date_col] = pd.to_datetime(df[date_col])
+            min_date = df[date_col].min().strftime('%Y-%m-%d')
+            max_date = df[date_col].max().strftime('%Y-%m-%d')
+            return f"{min_date} ~ {max_date}"
+        except:
+            return "Unknown Coverage"
+    return "No Date Column Found"
+
+def run_ai_diagnosis(prompt, context, sources_info):
+    """OpenAI API를 호출하여 진단 리포트를 생성합니다."""
+    system_prompt = """
+    You are an AI Business Data Consultant for 'AI ONLABS'.
+    Your job is to analyze the user's prompt and business context, and output a structured diagnosis report.
+    You MUST format your response strictly using these 4 exact headings (use Markdown H3 ###):
+    ### 1. Executive Summary
+    ### 2. Key Findings
+    ### 3. Root Causes
+    ### 4. Priority Actions
+    Do not add extra sections. Keep it professional, insightful, and concise.
+    """
+    
+    user_message = f"""
+    [Current Connected Sources & Coverage]
+    {sources_info}
+    
+    [User Prompt]
+    {prompt}
+    
+    [Additional Context]
+    {context if context else "None"}
+    
+    Based on the connected timeline and context, please provide the diagnosis.
+    """
+    
+    response = llm_client.chat.completions.create(
+        model="gpt-4o", # 보유하신 키의 권한에 따라 gpt-3.5-turbo로 변경 가능
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        temperature=0.7
+    )
+    return response.choices[0].message.content
+
+# ==========================================
+# 5. View: Projects
 # ==========================================
 def view_projects():
     st.title("AI ONLABS")
     st.write("Select a project to enter the workspace.")
     st.divider()
     
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown('''
-        <div class="card">
-            <h3 style="margin-top:0;">AJIOKA</h3>
-            <p>3 Connected Sources</p>
-            <p class="coverage-text">Last Analysis: Jul 24</p>
-        </div>
-        ''', unsafe_allow_html=True)
-        if st.button("Open Project →", key="btn_aji", use_container_width=True):
-            st.session_state.current_project = "AJIOKA"
-            navigate("Workspace")
-            
-    with col2:
-        st.markdown('''
-        <div class="card">
-            <h3 style="margin-top:0;">THE TOKYO PASS</h3>
-            <p>1 Connected Source</p>
-            <p class="coverage-text">Last Analysis: Jul 20</p>
-        </div>
-        ''', unsafe_allow_html=True)
-        if st.button("Open Project →", key="btn_ttp", use_container_width=True):
-            st.session_state.current_project = "THE TOKYO PASS"
-            navigate("Workspace")
-            
-    with col3:
-        st.markdown('''
-        <div class="card" style="display: flex; align-items: center; justify-content: center; height: 135px; border-style: dashed;">
-            <h3 style="color: #9CA3AF; margin: 0;">+ New Project</h3>
-        </div>
-        ''', unsafe_allow_html=True)
+    cols = st.columns(3)
+    for idx, proj in enumerate(st.session_state.projects):
+        col = cols[idx % 3]
+        with col:
+            st.markdown(f'''
+            <div class="card">
+                <h3 style="margin-top:0;">{proj["name"]}</h3>
+                <p>{proj["source_count"]} Connected Sources</p>
+                <p class="coverage-text">Last Analysis: {proj["last_analysis"]}</p>
+            </div>
+            ''', unsafe_allow_html=True)
+            if st.button("Open Project →", key=f"btn_proj_{idx}", use_container_width=True):
+                st.session_state.current_project = proj["name"]
+                navigate("Workspace")
+                
+    st.divider()
+    st.subheader("+ Create New Project")
+    with st.form("new_project_form", clear_on_submit=True):
+        new_proj_name = st.text_input("Project Name")
+        if st.form_submit_button("Create Project") and new_proj_name:
+            st.session_state.projects.append({"name": new_proj_name, "source_count": 0, "last_analysis": "Never"})
+            st.rerun()
 
 # ==========================================
-# 5. View: Workspace
+# 6. View: Workspace
 # ==========================================
 def view_workspace():
-    # Top Navigation Bar
     nav_col1, nav_col2, nav_col3 = st.columns([8, 1, 1])
     with nav_col1:
-        if st.button(f"← Projects ▾ {st.session_state.current_project}"):
-            navigate("Projects")
-    with nav_col2:
-        st.button("Workspace", use_container_width=True, disabled=True)
+        if st.button(f"← Projects ▾ {st.session_state.current_project}"): navigate("Projects")
+    with nav_col2: st.button("Workspace", use_container_width=True, disabled=True)
     with nav_col3:
-        if st.button("Archive", use_container_width=True): 
-            navigate("Archive")
+        if st.button("Archive", use_container_width=True): navigate("Archive")
         
     st.divider()
-    
-    # 2-Column Layout (35% / 65%)
     left_col, right_col = st.columns([3.5, 6.5], gap="large")
     
     # --- LEFT PANEL: Sources ---
     with left_col:
         st.subheader("Sources")
         if st.button("+ Add Source", use_container_width=True, type="secondary"):
-            st.info("Modal UI: Select platform (Advertising, Analytics, CRM) -> Upload Dataset")
+            st.session_state.show_add_source = not st.session_state.show_add_source
             
-        st.write("") # spacing
-            
+        if st.session_state.show_add_source:
+            with st.container(border=True):
+                platform = st.selectbox("Platform", ["Google Ads", "Meta Ads", "GA4", "Shopify"])
+                uploaded_file = st.file_uploader("Upload CSV Dataset", type=["csv"])
+                if st.button("Connect & Upload") and uploaded_file:
+                    with st.spinner("Uploading to Supabase & Analyzing timeline..."):
+                        # 1. Pandas로 읽고 날짜 계산
+                        df = pd.read_csv(uploaded_file)
+                        coverage = extract_date_range(df)
+                        
+                        # 2. Supabase Storage 업로드
+                        file_bytes = uploaded_file.getvalue()
+                        file_name = f"{st.session_state.current_project}_{platform}_{int(time.time())}.csv"
+                        try:
+                            supabase.storage.from_(BUCKET_NAME).upload(file_name, file_bytes)
+                            upload_success = True
+                        except Exception as e:
+                            st.error(f"Upload failed: {e}")
+                            upload_success = False
+
+                        if upload_success:
+                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                            st.session_state.sources.append({
+                                "name": platform, "status": "🟢 Ready", "latest": now_str,
+                                "coverage": coverage, "history": [f"{now_str} (Initial)"], "data_summary": f"Rows: {len(df)}, Cols: {len(df.columns)}"
+                            })
+                            st.session_state.projects[0]["source_count"] = len(st.session_state.sources)
+                            st.session_state.show_add_source = False
+                            st.rerun()
+                    
+        st.write("") 
         for idx, src in enumerate(st.session_state.sources):
             with st.expander(f"{src['name']}  ({src['status'].split(' ')[0]})", expanded=(idx==0)):
-                st.markdown(f"**Status:** {src['status']}")
-                st.markdown(f"**Latest Update:** {src['latest']}")
-                st.markdown(f"**Coverage:** `{src['coverage']}`")
-                
+                st.markdown(f"**Status:** {src['status']}<br>**Latest:** {src['latest']}<br>**Coverage:** `{src['coverage']}`", unsafe_allow_html=True)
                 st.markdown("---")
-                st.markdown("**▶ Data History**")
-                for hist in src['history']:
-                    st.caption(f"📄 dataset_{src['name'].lower().replace(' ', '_')}.csv - {hist}")
-                
-                st.write("")
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("Add Dataset", key=f"add_{idx}", use_container_width=True):
-                        st.success("New Date Range Detected. Appending to timeline...")
-                with col_b:
-                    st.button("Replace Latest", key=f"rep_{idx}", use_container_width=True)
+                st.markdown("**▶ Data History (Timeline)**")
+                for hist in src['history']: st.caption(f"📄 dataset.csv - {hist}")
 
     # --- RIGHT PANEL: Analysis ---
     with right_col:
         st.subheader("Analysis")
+        source_names = ", ".join([s['name'] for s in st.session_state.sources])
+        st.info(f"💡 **Current Timeline Context**\n\nSources: {source_names if source_names else 'None'}")
         
-        # Context Banner
-        st.info("💡 **Current Timeline Context**\n\nSources: Google Ads, GA4 | Coverage: `2026-01-03 ~ 2026-07-24`")
-        
-        # If no result is present, show Prompt input
         if st.session_state.analysis_result is None:
             st.markdown("### What would you like to analyze?")
-            
-            # Suggested chips
             s_col1, s_col2, s_col3 = st.columns(3)
             if s_col1.button("Performance Review", use_container_width=True): st.session_state.prompt_input = "Performance Review"
             if s_col2.button("Campaign Diagnosis", use_container_width=True): st.session_state.prompt_input = "Campaign Diagnosis"
             if s_col3.button("Trend Analysis", use_container_width=True): st.session_state.prompt_input = "Trend Analysis"
             
             prompt = st.text_area("Prompt", value=st.session_state.prompt_input, height=100)
-            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target ROAS is 250%. Budget increased on July 10.")
+            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target ROAS is 250%.")
             
             if st.button("Run Diagnosis", type="primary"):
-                if not prompt:
-                    st.warning("Please enter a prompt or select a suggestion.")
+                if not st.session_state.sources:
+                    st.error("Please add at least one data source first!")
+                elif not prompt:
+                    st.warning("Please enter a prompt.")
                 else:
-                    with st.spinner("Analyzing timeline data and generating insights..."):
-                        time.sleep(1.5) # Fake processing time
+                    with st.spinner("AI is diagnosing your business timeline..."):
+                        # 소스 정보 텍스트화
+                        sources_info = "\\n".join([f"- {s['name']} (Coverage: {s['coverage']}, {s['data_summary']})" for s in st.session_state.sources])
+                        
+                        # 실제 OpenAI API 호출
+                        ai_report = run_ai_diagnosis(prompt, context, sources_info)
                         
                         st.session_state.analysis_result = {
                             "title": prompt,
-                            "date": "Jul 24",
-                            "sources": "Google Ads, GA4",
-                            "coverage": "2026-01-03 ~ 2026-07-24",
-                            "context": context
+                            "date": datetime.now().strftime("%b %d"),
+                            "sources": source_names,
+                            "coverage": "Evaluated on all available timelines",
+                            "report_content": ai_report
                         }
                         st.session_state.archives.insert(0, st.session_state.analysis_result)
+                        st.session_state.projects[0]["last_analysis"] = datetime.now().strftime("%b %d")
                         st.rerun()
-                        
-        # If result is generated, show Report Document
         else:
             res = st.session_state.analysis_result
             if st.button("← Back to Prompt"):
                 st.session_state.analysis_result = None
-                st.session_state.prompt_input = ""
                 st.rerun()
                 
             st.markdown(f"# {res['title']}")
-            st.caption(f"Generated: {res['date']} | Sources: {res['sources']} | Coverage: {res['coverage']}")
-            if res.get('context'):
-                st.caption(f"Context: {res['context']}")
+            st.caption(f"Generated: {res['date']} | Sources: {res['sources']}")
             st.divider()
             
-            st.markdown("### 1. Executive Summary")
-            st.write("Overall business performance maintained a stable trajectory over the analyzed timeline. However, efficiency metrics (ROAS and CPA) have shown slight degradation in the final two weeks of the coverage period (July 10 - July 24), despite a 15% increase in top-of-funnel traffic.")
-            
-            st.markdown("### 2. Key Findings")
-            st.markdown("- **Traffic Volume (MoM):** Total sessions increased by 15%, primarily driven by Google Ads.\n- **Conversion Rate (Trend):** Dropped from an average of 2.4% in early Q2 to 1.9% in mid-July.\n- **Cost Efficiency:** CPA on Google Ads rose by 12% following the budget increase.")
-            
-            st.markdown("### 3. Root Causes")
-            st.write("The recent decline in Conversion Rate correlates directly with the expanded audience targeting implemented around July 10. The appended dataset reveals that while these new segments generate cheaper clicks, they lack purchase intent, thereby diluting overall ROAS and increasing CPA.")
-            
-            st.markdown("### 4. Priority Actions")
-            st.markdown("1. **Refine Targeting:** Immediately narrow the audience parameters on the newly expanded Google Ads campaigns to focus on higher-intent users.\n2. **Budget Reallocation:** Shift 15% of the current top-of-funnel budget back to proven remarketing channels.\n3. **Monitor Timeline:** Upload the next batch of data in 3 days to verify if the ROAS trend reverses toward the 250% target.")
+            # OpenAI가 마크다운으로 내려준 4가지 섹션을 그대로 출력
+            st.markdown(res['report_content'])
 
 # ==========================================
-# 6. View: Archive
+# 7. View: Archive & Router Logic
 # ==========================================
 def view_archive():
     nav_col1, nav_col2, nav_col3 = st.columns([8, 1, 1])
     with nav_col1:
-        if st.button(f"← Projects ▾ {st.session_state.current_project}"):
-            navigate("Projects")
+        if st.button(f"← Projects ▾ {st.session_state.current_project}"): navigate("Projects")
     with nav_col2:
         if st.button("Workspace", use_container_width=True): navigate("Workspace")
-    with nav_col3:
-        st.button("Archive", use_container_width=True, disabled=True)
+    with nav_col3: st.button("Archive", use_container_width=True, disabled=True)
         
     st.divider()
-    
     left_col, right_col = st.columns([3.5, 6.5], gap="large")
     
     with left_col:
@@ -243,35 +281,17 @@ def view_archive():
     with right_col:
         if 'selected_archive' in st.session_state:
             arch = st.session_state.selected_archive
-            st.markdown(f"# {arch.get('title', 'Analysis')}")
-            st.caption(f"Generated: {arch.get('date', 'Unknown')} | Coverage: {arch.get('coverage', 'N/A')}")
+            st.markdown(f"# {arch['title']}")
+            st.caption(f"Generated: {arch['date']} | Sources: {arch['sources']}")
             st.divider()
-            
-            st.markdown("### 1. Executive Summary")
-            st.write("This is a historical record of the diagnosis run on " + arch.get('date', 'Unknown') + ". The core metrics indicated a stable environment but required immediate review on campaign spending.")
-            
-            st.markdown("### 2. Key Findings")
-            st.write("- Historical traffic remained consistent.\n- Prior conversion rates were stable at 2.4%.")
-            
-            st.markdown("### 3. Root Causes")
-            st.write("Identified minor seasonality impacts during the early weeks of the coverage timeline.")
-            
-            st.markdown("### 4. Priority Actions")
-            st.write("1. Maintain current budget allocations.\n2. Upload fresh dataset next week to track MoM changes.")
-            
+            st.markdown(arch['report_content'])
             st.divider()
             if st.button("Re-run with latest timeline data"):
-                st.session_state.prompt_input = arch.get('prompt', arch.get('title'))
+                st.session_state.prompt_input = arch['title']
                 navigate("Workspace")
         else:
             st.info("Select a diagnosis from the history to view its details.")
 
-# ==========================================
-# 7. Router Logic
-# ==========================================
-if st.session_state.page == 'Projects':
-    view_projects()
-elif st.session_state.page == 'Workspace':
-    view_workspace()
-elif st.session_state.page == 'Archive':
-    view_archive()
+if st.session_state.page == 'Projects': view_projects()
+elif st.session_state.page == 'Workspace': view_workspace()
+elif st.session_state.page == 'Archive': view_archive()
