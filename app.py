@@ -3,9 +3,10 @@ import pandas as pd
 import time
 from datetime import datetime
 import io
+import re
 from supabase import create_client, Client
 from openai import OpenAI
-import numpy as np  # 누락되었을 수 있는 numpy 라이브러리 추가
+import numpy as np
 
 # ==========================================
 # 1. API & DB Setup
@@ -44,7 +45,7 @@ st.markdown('''
 ''', unsafe_allow_html=True)
 
 # ==========================================
-# 3. Session State Initialization (프로젝트 격리)
+# 3. Session State Initialization
 # ==========================================
 if 'page' not in st.session_state: st.session_state.page = 'Projects'
 if 'current_project' not in st.session_state: st.session_state.current_project = None
@@ -80,18 +81,28 @@ def load_csv_smart(file_bytes):
         except Exception:
             continue
 
-    for skip in [2, 1, 0, 3]:
+    # 1. GA4 방식: '#' 기호로 시작하는 줄을 주석으로 처리하고 로드
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use, comment='#')
+        if len(df.columns) > 2:
+            return df, encoding_to_use
+    except Exception:
+        pass
+
+    # 2. Google Ads 방식: 위에서부터 불필요한 줄을 하나씩 건너뛰며 로드 (최대 12줄)
+    for skip in range(13):
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), skiprows=skip, encoding=encoding_to_use)
             first_col = str(df.columns[0])
             if len(df.columns) > 2 and 'レポート' not in first_col and 'Report' not in first_col:
-                return df
+                return df, encoding_to_use
         except Exception:
             continue
             
-    return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use)
+    return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use), encoding_to_use
 
-def extract_date_range(df):
+def extract_date_range(df, file_bytes, encoding):
+    # 1. 표(DataFrame) 안에 날짜 컬럼이 있는지 확인 (시계열 데이터)
     date_cols = [col for col in df.columns if any(kw in str(col).lower() for kw in ['date', 'day', 'time', '週', '日', '月', '年'])]
     if date_cols:
         date_col = date_cols[0]
@@ -101,13 +112,23 @@ def extract_date_range(df):
             max_date = parsed_dates.max().strftime('%Y-%m-%d')
             return f"{min_date} ~ {max_date}"
         except:
-            return "Unknown Coverage"
-    return "No Date Column Found"
+            pass
+            
+    # 2. 표에 날짜가 없다면 파일 메타데이터(상단 주석)에서 추출 시도 (GA4 방식)
+    try:
+        decoded_text = file_bytes.decode(encoding)
+        start_match = re.search(r'開始日:\s*(\d{8})', decoded_text)
+        end_match = re.search(r'終了日:\s*(\d{8})', decoded_text)
+        if start_match and end_match:
+            start_date = pd.to_datetime(start_match.group(1)).strftime('%Y-%m-%d')
+            end_date = pd.to_datetime(end_match.group(1)).strftime('%Y-%m-%d')
+            return f"{start_date} ~ {end_date}"
+    except Exception:
+        pass
+        
+    return "Unknown Coverage (Summary)"
 
 def prepare_data_for_ai(df):
-    """
-    Pandas를 활용해 데이터를 캠페인별/날짜별 피벗 테이블로 정확하게 요약합니다.
-    """
     cols_lower = [str(c).lower().strip() for c in df.columns]
     
     def find_col(exact_kws, partial_kws):
@@ -119,10 +140,10 @@ def prepare_data_for_ai(df):
         
     date_col = find_col(['週', '日', 'date', 'day'], ['time', 'date', '月'])
     campaign_col = find_col(['キャンペーン', 'campaign'], ['campaign', 'キャンペーン'])
-    cost_col = find_col(['費用', 'cost', 'spend'], ['金額', 'cost'])
-    click_col = find_col(['クリック数', 'clicks'], ['click', 'クリック'])
-    imp_col = find_col(['表示回数', 'impressions'], ['imp', '表示'])
-    conv_col = find_col(['コンバージョン', 'conversions'], ['conv', 'コンバージョン'])
+    cost_col = find_col(['費用', '広告費用', 'cost', 'spend'], ['金額', 'cost'])
+    click_col = find_col(['クリック数', '広告のクリック数', 'clicks'], ['click', 'クリック'])
+    imp_col = find_col(['表示回数', '広告の表示回数', 'impressions'], ['imp', '表示'])
+    conv_col = find_col(['コンバージョン', 'キーイベント', 'conversions'], ['conv', 'コンバージョン', 'キーイベント'])
     
     for col in [cost_col, click_col, imp_col, conv_col]:
         if col and col in df.columns:
@@ -166,10 +187,10 @@ def run_ai_diagnosis(prompt, context, sources_info):
 
     [핵심 분석 룰]
     1. 'Campaign Performance Summary'의 캠페인 이름(예: 【KP】ACe_Demandgen 등)을 반드시 정확하게 명시하여 분석하세요.
-    2. CPA가 극단적으로 높거나, 비용(Cost)은 많이 썼는데 전환(Conversion)이 0인 캠페인은 "즉시 OFF 또는 예산 대폭 축소" 대상입니다.
+    2. CPA가 극단적으로 높거나, 비용(Cost)은 많이 썼는데 전환(Conversion/KeyEvent)이 0인 캠페인은 "즉시 OFF 또는 예산 대폭 축소" 대상입니다.
     3. CPA가 타겟 단가에 부합하거나 효율이 매우 좋은 캠페인은 "예산 증액(Scale-up)" 대상입니다.
     4. 분석할 때 반드시 실제 수치(비용, CPA, 전환수 등)를 괄호나 문장 속에 포함하여 설득력을 높이세요.
-    5. 'Time-series Trend'를 보고 주차별/일자별로 매체 효율이 악화되고 있는지, 개선되고 있는지 짚어내세요.
+    5. 'Time-series Trend'를 보고 주차별/일자별로 매체 효율이 악화되고 있는지, 개선되고 있는지 짚어내세요 (데이터가 있을 경우만).
     6. **반드시 마케팅 실무 용어(예: 지면 최적화, 머신러닝 안정화, 디마케팅, ROAS/CPA 한계점, 타겟팅 뎁스 등)를 자연스럽게 구사하세요.**
 
     반드시 아래 4가지 H3(###) 헤딩 구조를 엄격하게 지켜서 마크다운으로 출력하세요. 절대 영어로 출력하지 마세요:
@@ -271,8 +292,8 @@ def view_workspace():
                     with st.spinner("Uploading to Supabase & Analyzing timeline..."):
                         file_bytes = uploaded_file.getvalue()
                         try:
-                            df = load_csv_smart(file_bytes)
-                            coverage = extract_date_range(df)
+                            df, enc = load_csv_smart(file_bytes)
+                            coverage = extract_date_range(df, file_bytes, enc)
                             raw_csv_data = prepare_data_for_ai(df)
                         except Exception as e:
                             st.error(f"데이터 파싱 에러: {e}")
