@@ -104,26 +104,31 @@ def extract_date_range(df):
             return "Unknown Coverage"
     return "No Date Column Found"
 
+
 def prepare_data_for_ai(df):
     """
-    Pandas를 활용해 데이터를 캠페인별/날짜별 피벗 테이블로 요약하여 AI에게 전달합니다.
+    Pandas를 활용해 데이터를 캠페인별/날짜별 피벗 테이블로 정확하게 요약합니다.
     """
-    cols = [str(c).lower() for c in df.columns]
+    cols_lower = [str(c).lower().strip() for c in df.columns]
     
-    def find_col(keywords):
-        for i, c in enumerate(cols):
-            if any(k in c for k in keywords):
-                return df.columns[i]
+    def find_col(exact_kws, partial_kws):
+        # 1. 100% 일치하는 컬럼(정확도 최우선)을 먼저 찾음
+        for i, c in enumerate(cols_lower):
+            if c in exact_kws: return df.columns[i]
+        # 2. 없으면 단어가 포함된 컬럼을 찾음
+        for i, c in enumerate(cols_lower):
+            if any(k in c for k in partial_kws): return df.columns[i]
         return None
         
-    date_col = find_col(['date', 'day', 'time', '週', '日', '月'])
-    campaign_col = find_col(['campaign', 'キャンペーン'])
-    cost_col = find_col(['cost', 'spend', '費用', '金額'])
-    click_col = find_col(['click', 'クリック'])
-    imp_col = find_col(['impression', '表示'])
-    conv_col = find_col(['conversion', 'コンバージョン'])
+    date_col = find_col(['週', '日', 'date', 'day'], ['time', 'date', '月'])
+    # 캠페인 이름 정확히 매칭 ('キャンペーン タイプ' 등과 혼동 방지)
+    campaign_col = find_col(['キャンペーン', 'campaign'], ['campaign', 'キャンペーン'])
+    cost_col = find_col(['費用', 'cost', 'spend'], ['金額', 'cost'])
+    click_col = find_col(['クリック数', 'clicks'], ['click', 'クリック'])
+    imp_col = find_col(['表示回数', 'impressions'], ['imp', '表示'])
+    conv_col = find_col(['コンバージョン', 'conversions'], ['conv', 'コンバージョン'])
     
-    # 콤마 및 퍼센트 제거 후 숫자형 변환
+    # 콤마 및 퍼센트 제거 후 숫자형(Float) 변환
     for col in [cost_col, click_col, imp_col, conv_col]:
         if col and col in df.columns:
             df[col] = df[col].astype(str).str.replace(',', '').str.replace('%', '')
@@ -139,11 +144,11 @@ def prepare_data_for_ai(df):
     # 1. 캠페인별 성과 요약 피벗
     if campaign_col and agg_dict:
         camp_summary = df.groupby(campaign_col).agg(agg_dict).reset_index()
-        # CPA 및 CTR 계산
+        # CPA 및 CTR 계산 (ZeroDivision 방지)
         if conv_col and cost_col:
-            camp_summary['Calculated_CPA'] = np.where(camp_summary[conv_col] > 0, camp_summary[cost_col] / camp_summary[conv_col], 0)
+            camp_summary['CPA'] = np.where(camp_summary[conv_col] > 0, (camp_summary[cost_col] / camp_summary[conv_col]).round(0), 0)
         if click_col and imp_col:
-            camp_summary['Calculated_CTR(%)'] = np.where(camp_summary[imp_col] > 0, (camp_summary[click_col] / camp_summary[imp_col]) * 100, 0)
+            camp_summary['CTR(%)'] = np.where(camp_summary[imp_col] > 0, ((camp_summary[click_col] / camp_summary[imp_col]) * 100).round(2), 0)
             
         summary_text += "--- [Campaign Performance Summary (Aggregated)] ---\n"
         summary_text += camp_summary.to_csv(index=False) + "\n\n"
@@ -151,10 +156,11 @@ def prepare_data_for_ai(df):
     # 2. 날짜별 트렌드 요약 피벗
     if date_col and agg_dict:
         trend_summary = df.groupby(date_col).agg(agg_dict).reset_index().sort_values(by=date_col)
+        if conv_col and cost_col:
+            trend_summary['CPA'] = np.where(trend_summary[conv_col] > 0, (trend_summary[cost_col] / trend_summary[conv_col]).round(0), 0)
         summary_text += "--- [Time-series Trend Summary (Aggregated)] ---\n"
         summary_text += trend_summary.to_csv(index=False) + "\n"
         
-    # 만약 매칭되는 컬럼이 없어 요약에 실패했다면 기본 데이터 제공
     if not summary_text:
         df_cleaned = df.dropna(axis=1, how='all')
         summary_text = df_cleaned.tail(150).to_csv(index=False)
@@ -163,35 +169,35 @@ def prepare_data_for_ai(df):
 
 def run_ai_diagnosis(prompt, context, sources_info):
     system_prompt = """
-    당신은 'AI ONLABS'의 수석 퍼포먼스 마케터(Senior Performance Marketer)이자 데이터 분석가입니다.
-    사용자가 업로드한 광고/비즈니스 데이터의 '피벗 테이블(요약본)'을 바탕으로 날카롭고 실무적인 진단 리포트를 작성해야 합니다.
+    당신은 7년 차 탑티어 퍼포먼스 마케터(Performance Marketer)입니다.
+    제공된 데이터(피벗 테이블)를 분석하여 광고주가 즉시 광고 시스템에 접속해 조치를 취할 수 있는 수준의 '매체 최적화 액션플랜'을 도출해야 합니다.
 
-    [핵심 분석 지침 - CRITICAL INSTRUCTION]
-    1. 데이터 구조(행이 몇 개인지 등)에 대한 언급은 절대 금지합니다.
-    2. 'Campaign Performance Summary'를 보고 비용은 높으나 전환이 없는(CPA가 비정상적으로 높은) '예산 낭비(Wasted Spend)' 캠페인을 콕 집어내어 예산 축소나 OFF를 권고하세요.
-    3. CPA가 낮고 전환 볼륨이 좋은 '스케일업(Scale-up)' 대상 캠페인을 찾아 예산 증액을 제안하세요.
-    4. 'Time-series Trend Summary'를 보고 주차별/일자별 예산 소진 트렌드 및 성과 하락 추세를 짚어내세요.
-    5. 실무 퍼포먼스 마케팅 용어(예: 매체 효율, 볼륨 최적화, 타겟팅 뎁스, 논타겟 트래픽, 스케일링 등)를 사용하여 전문가처럼 작성하세요.
-    6. **모든 출력 결과는 반드시 '한국어(Korean)'로 작성해야 합니다.**
+    [핵심 분석 룰]
+    1. 'Campaign Performance Summary'의 캠페인 이름(예: 【KP】ACe_Demandgen 등)을 반드시 정확하게 명시하여 분석하세요.
+    2. CPA가 극단적으로 높거나, 비용(Cost)은 많이 썼는데 전환(Conversion)이 0인 캠페인은 "즉시 OFF 또는 예산 대폭 축소" 대상입니다.
+    3. CPA가 타겟 단가에 부합하거나 효율이 매우 좋은 캠페인은 "예산 증액(Scale-up)" 대상입니다.
+    4. 분석할 때 반드시 실제 수치(비용, CPA, 전환수 등)를 괄호나 문장 속에 포함하여 설득력을 높이세요.
+    5. 'Time-series Trend'를 보고 주차별/일자별로 매체 효율이 악화되고 있는지, 개선되고 있는지 짚어내세요.
+    6. **반드시 마케팅 실무 용어(예: 지면 최적화, 머신러닝 안정화, 디마케팅, ROAS/CPA 한계점, 타겟팅 뎁스 등)를 자연스럽게 구사하세요.**
 
-    반드시 아래 4가지 H3(###) 헤딩 구조를 엄격하게 지켜서 마크다운으로 출력하세요:
-    ### 1. Executive Summary (현 상황에 대한 마케터 관점의 핵심 요약)
-    ### 2. Key Findings (데이터 기반의 주요 발견 사항 및 효율/비효율 캠페인 식별)
-    ### 3. Root Causes (수치 변화나 효율 저하의 근본적인 데이터 원인 분석)
-    ### 4. Priority Actions (지금 당장 마케터가 광고 매체에서 실행해야 할 구체적인 액션 아이템)
+    반드시 아래 4가지 H3(###) 헤딩 구조를 엄격하게 지켜서 마크다운으로 출력하세요. 절대 영어로 출력하지 마세요:
+    ### 1. Executive Summary (성과 현황 요약)
+    ### 2. Key Findings (캠페인별 세부 효율 진단)
+    ### 3. Root Causes (효율 상승/하락의 데이터적 근거)
+    ### 4. Priority Actions (마케터가 지금 당장 실행해야 할 매체 최적화 액션)
     """
     
     user_message = f"""
-    [Current Connected Sources, Coverage, and AGGREGATED DATA]
+    [데이터 요약본 (캠페인별 & 시계열)]
     {sources_info}
     
-    [User Prompt]
+    [사용자 분석 요청]
     {prompt}
     
-    [Additional Context]
+    [추가 비즈니스 컨텍스트]
     {context if context else "None"}
     
-    위 요약 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 한국어로 작성해 주세요.
+    위 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 한국어로 작성해 주세요.
     """
     
     response = llm_client.chat.completions.create(
@@ -200,162 +206,10 @@ def run_ai_diagnosis(prompt, context, sources_info):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        temperature=0.7
+        temperature=0.5
     )
     return response.choices[0].message.content
 
-# ==========================================
-# 5. View: Projects
-# ==========================================
-def view_projects():
-    st.title("AI ONLABS")
-    st.write("Select a project to enter the workspace.")
-    st.divider()
-    
-    cols = st.columns(3)
-    idx = 0
-    for proj_name, proj_data in st.session_state.projects.items():
-        col = cols[idx % 3]
-        with col:
-            st.markdown(f'''
-            <div class="card">
-                <h3 style="margin-top:0;">{proj_name}</h3>
-                <p>{proj_data["source_count"]} Connected Sources</p>
-                <p class="coverage-text">Last Analysis: {proj_data["last_analysis"]}</p>
-            </div>
-            ''', unsafe_allow_html=True)
-            if st.button("Open Project →", key=f"btn_proj_{idx}", use_container_width=True):
-                st.session_state.current_project = proj_name
-                navigate("Workspace")
-        idx += 1
-                
-    st.divider()
-    st.subheader("+ Create New Project")
-    with st.form("new_project_form", clear_on_submit=True):
-        new_proj_name = st.text_input("Project Name")
-        if st.form_submit_button("Create Project") and new_proj_name:
-            if new_proj_name not in st.session_state.projects:
-                st.session_state.projects[new_proj_name] = {
-                    "source_count": 0, 
-                    "last_analysis": "Never", 
-                    "sources": [], 
-                    "archives": []
-                }
-            st.rerun()
-
-# ==========================================
-# 6. View: Workspace
-# ==========================================
-def view_workspace():
-    curr_proj = st.session_state.current_project
-    proj_data = st.session_state.projects[curr_proj]
-    
-    nav_col1, nav_col2, nav_col3 = st.columns([8, 1, 1])
-    with nav_col1:
-        if st.button(f"← Projects ▾ {curr_proj}"): navigate("Projects")
-    with nav_col2: st.button("Workspace", use_container_width=True, disabled=True)
-    with nav_col3:
-        if st.button("Archive", use_container_width=True): navigate("Archive")
-        
-    st.divider()
-    left_col, right_col = st.columns([3.5, 6.5], gap="large")
-    
-    with left_col:
-        st.subheader("Sources")
-        if st.button("+ Add Source", use_container_width=True, type="secondary"):
-            st.session_state.show_add_source = not st.session_state.show_add_source
-            
-        if st.session_state.show_add_source:
-            with st.container(border=True):
-                platform = st.selectbox("Platform", ["Google Ads", "Meta Ads", "GA4", "Shopify"])
-                uploaded_file = st.file_uploader("Upload CSV Dataset", type=["csv"])
-                if st.button("Connect & Upload") and uploaded_file:
-                    with st.spinner("Uploading to Supabase & Analyzing timeline..."):
-                        file_bytes = uploaded_file.getvalue()
-                        try:
-                            df = load_csv_smart(file_bytes)
-                            coverage = extract_date_range(df)
-                            raw_csv_data = prepare_data_for_ai(df) # 피벗 테이블로 정제된 텍스트 반환
-                        except Exception as e:
-                            st.error(f"데이터 파싱 에러: {e}")
-                            st.stop()
-                        
-                        file_name = f"{curr_proj}_{platform}_{int(time.time())}.csv"
-                        try:
-                            supabase.storage.from_(BUCKET_NAME).upload(file_name, file_bytes)
-                            upload_success = True
-                        except Exception as e:
-                            st.error(f"Upload failed: {e}")
-                            upload_success = False
-
-                        if upload_success:
-                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                            proj_data["sources"].append({
-                                "name": platform, "status": "🟢 Ready", "latest": now_str,
-                                "coverage": coverage, "history": [f"{now_str} (Initial)"], 
-                                "raw_data": raw_csv_data
-                            })
-                            proj_data["source_count"] = len(proj_data["sources"])
-                            st.session_state.show_add_source = False
-                            st.rerun()
-                    
-        st.write("") 
-        for idx, src in enumerate(proj_data["sources"]):
-            with st.expander(f"{src['name']}  ({src['status'].split(' ')[0]})", expanded=(idx==0)):
-                st.markdown(f"**Status:** {src['status']}<br>**Latest:** {src['latest']}<br>**Coverage:** `{src['coverage']}`", unsafe_allow_html=True)
-                st.markdown("---")
-                st.markdown("**▶ Data History (Timeline)**")
-                for hist in src['history']: st.caption(f"📄 dataset.csv - {hist}")
-
-    with right_col:
-        st.subheader("Analysis")
-        source_names = ", ".join([s['name'] for s in proj_data["sources"]])
-        st.info(f"💡 **Current Timeline Context**\n\nSources: {source_names if source_names else 'None'}")
-        
-        if st.session_state.analysis_result is None:
-            st.markdown("### What would you like to analyze?")
-            s_col1, s_col2, s_col3 = st.columns(3)
-            if s_col1.button("Performance Review", use_container_width=True): st.session_state.prompt_input = "Performance Review"
-            if s_col2.button("Campaign Diagnosis", use_container_width=True): st.session_state.prompt_input = "Campaign Diagnosis"
-            if s_col3.button("Trend Analysis", use_container_width=True): st.session_state.prompt_input = "Trend Analysis"
-            
-            prompt = st.text_area("Prompt", value=st.session_state.prompt_input, height=100)
-            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target CPA is 5000 JPY.")
-            
-            if st.button("Run Diagnosis", type="primary"):
-                if not proj_data["sources"]:
-                    st.error("Please add at least one data source first!")
-                elif not prompt:
-                    st.warning("Please enter a prompt.")
-                else:
-                    with st.spinner("AI is analyzing real business metrics..."):
-                        sources_info = ""
-                        for s in proj_data["sources"]:
-                            sources_info += f"\n--- Source: {s['name']} (Coverage: {s['coverage']}) ---\n"
-                            sources_info += f"```csv\n{s['raw_data']}\n```\n"
-                        
-                        ai_report = run_ai_diagnosis(prompt, context, sources_info)
-                        
-                        st.session_state.analysis_result = {
-                            "title": prompt,
-                            "date": datetime.now().strftime("%b %d"),
-                            "sources": source_names,
-                            "coverage": "Evaluated on all available timelines",
-                            "report_content": ai_report
-                        }
-                        proj_data["archives"].insert(0, st.session_state.analysis_result)
-                        proj_data["last_analysis"] = datetime.now().strftime("%b %d")
-                        st.rerun()
-        else:
-            res = st.session_state.analysis_result
-            if st.button("← Back to Prompt"):
-                st.session_state.analysis_result = None
-                st.rerun()
-                
-            st.markdown(f"# {res['title']}")
-            st.caption(f"Generated: {res['date']} | Sources: {res['sources']}")
-            st.divider()
-            st.markdown(res['report_content'])
 
 # ==========================================
 # 7. View: Archive & Router Logic
