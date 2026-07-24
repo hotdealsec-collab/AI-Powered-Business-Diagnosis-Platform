@@ -68,7 +68,6 @@ def navigate(page_name):
 # ==========================================
 def load_csv_smart(file_bytes):
     """Google Ads 등 메타데이터가 포함된 CSV를 자동으로 인식하고 읽어옵니다."""
-    # 1. 인코딩 감지 시도
     encoding_to_use = 'utf-8-sig'
     for enc in ['utf-8-sig', 'utf-8', 'shift_jis', 'cp932', 'utf-16']:
         try:
@@ -78,22 +77,18 @@ def load_csv_smart(file_bytes):
         except Exception:
             continue
 
-    # 2. 메타데이터(헤더 설명)를 건너뛰며 유효한 표 형태를 찾습니다 (0~3줄 건너뛰기)
     for skip in [2, 1, 0, 3]:
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), skiprows=skip, encoding=encoding_to_use)
-            # 열 개수가 충분히 많고, 첫 번째 열이 리포트 제목이 아니라면 정상적인 데이터로 간주
             first_col = str(df.columns[0])
             if len(df.columns) > 2 and 'レポート' not in first_col and 'Report' not in first_col:
                 return df
         except Exception:
             continue
             
-    # 위 조건에 모두 맞지 않으면 기본값으로 로드 시도
     return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding_to_use)
 
 def extract_date_range(df):
-    """Pandas를 이용해 날짜 컬럼을 찾고 Coverage를 계산합니다. (일본어 지원)"""
     date_cols = [col for col in df.columns if any(kw in str(col).lower() for kw in ['date', 'day', 'time', '週', '日', '月', '年'])]
     if date_cols:
         date_col = date_cols[0]
@@ -106,21 +101,35 @@ def extract_date_range(df):
             return "Unknown Coverage"
     return "No Date Column Found"
 
+def prepare_data_for_ai(df):
+    """AI가 분석할 수 있도록 핵심 데이터를 텍스트로 변환합니다."""
+    # 빈 컬럼 제거 및 최근 150줄로 제한 (토큰 한도 방지)
+    df_cleaned = df.dropna(axis=1, how='all')
+    df_sample = df_cleaned.tail(150)
+    return df_sample.to_csv(index=False)
+
 def run_ai_diagnosis(prompt, context, sources_info):
     """OpenAI API를 호출하여 진단 리포트를 생성합니다."""
     system_prompt = """
-    You are an AI Business Data Consultant for 'AI ONLABS'.
-    Your job is to analyze the user's prompt and business context, and output a structured diagnosis report.
+    You are an expert AI Business & Performance Marketing Consultant for 'AI ONLABS'.
+    You will be provided with actual business data (in CSV format) uploaded by the user.
+    
+    CRITICAL INSTRUCTION:
+    - Do NOT talk about the file structure (e.g., "The dataset has 95 rows and 29 columns").
+    - Do NOT suggest "getting more data" as a primary action.
+    - Instead, deeply analyze the actual business metrics in the data (e.g., Cost, Clicks, Impressions, CPA, Conversions, ROAS, trends over time, campaign performance).
+    - Identify specific campaigns that are working well, and which ones are failing or spending inefficiently. Provide data-backed reasons.
+    
     You MUST format your response strictly using these 4 exact headings (use Markdown H3 ###):
     ### 1. Executive Summary
     ### 2. Key Findings
     ### 3. Root Causes
     ### 4. Priority Actions
-    Do not add extra sections. Keep it professional, insightful, and concise.
+    Do not add extra sections. Keep it professional, highly analytical, and actionable.
     """
     
     user_message = f"""
-    [Current Connected Sources & Coverage]
+    [Current Connected Sources, Coverage, and RAW DATA]
     {sources_info}
     
     [User Prompt]
@@ -129,7 +138,7 @@ def run_ai_diagnosis(prompt, context, sources_info):
     [Additional Context]
     {context if context else "None"}
     
-    Based on the connected timeline and context, please provide the diagnosis.
+    Based on the provided raw data timeline and context, please provide the diagnosis. Focus on the actual metric numbers.
     """
     
     response = llm_client.chat.completions.create(
@@ -187,7 +196,6 @@ def view_workspace():
     st.divider()
     left_col, right_col = st.columns([3.5, 6.5], gap="large")
     
-    # --- LEFT PANEL: Sources ---
     with left_col:
         st.subheader("Sources")
         if st.button("+ Add Source", use_container_width=True, type="secondary"):
@@ -202,15 +210,14 @@ def view_workspace():
                         
                         file_bytes = uploaded_file.getvalue()
                         
-                        # 1. 스마트 로더를 통해 CSV를 깨끗한 표(DataFrame)로 가져오기
                         try:
                             df = load_csv_smart(file_bytes)
                             coverage = extract_date_range(df)
+                            raw_csv_data = prepare_data_for_ai(df) # AI용 데이터 추출
                         except Exception as e:
                             st.error(f"데이터 파싱 에러: {e}")
                             st.stop()
                         
-                        # 2. Supabase Storage 업로드
                         file_name = f"{st.session_state.current_project}_{platform}_{int(time.time())}.csv"
                         try:
                             supabase.storage.from_(BUCKET_NAME).upload(file_name, file_bytes)
@@ -223,7 +230,8 @@ def view_workspace():
                             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                             st.session_state.sources.append({
                                 "name": platform, "status": "🟢 Ready", "latest": now_str,
-                                "coverage": coverage, "history": [f"{now_str} (Initial)"], "data_summary": f"Rows: {len(df)}, Cols: {len(df.columns)}"
+                                "coverage": coverage, "history": [f"{now_str} (Initial)"], 
+                                "raw_data": raw_csv_data # 메모리에 실데이터 적재
                             })
                             st.session_state.projects[0]["source_count"] = len(st.session_state.sources)
                             st.session_state.show_add_source = False
@@ -237,7 +245,6 @@ def view_workspace():
                 st.markdown("**▶ Data History (Timeline)**")
                 for hist in src['history']: st.caption(f"📄 dataset.csv - {hist}")
 
-    # --- RIGHT PANEL: Analysis ---
     with right_col:
         st.subheader("Analysis")
         source_names = ", ".join([s['name'] for s in st.session_state.sources])
@@ -251,7 +258,7 @@ def view_workspace():
             if s_col3.button("Trend Analysis", use_container_width=True): st.session_state.prompt_input = "Trend Analysis"
             
             prompt = st.text_area("Prompt", value=st.session_state.prompt_input, height=100)
-            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target ROAS is 250%.")
+            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target CPA is 5000 JPY.")
             
             if st.button("Run Diagnosis", type="primary"):
                 if not st.session_state.sources:
@@ -259,11 +266,14 @@ def view_workspace():
                 elif not prompt:
                     st.warning("Please enter a prompt.")
                 else:
-                    with st.spinner("AI is diagnosing your business timeline..."):
-                        # 소스 정보 텍스트화
-                        sources_info = "\n".join([f"- {s['name']} (Coverage: {s['coverage']}, {s['data_summary']})" for s in st.session_state.sources])
+                    with st.spinner("AI is analyzing real business metrics..."):
                         
-                        # 실제 OpenAI API 호출
+                        # 각 소스의 '실제 데이터'를 프롬프트에 조립
+                        sources_info = ""
+                        for s in st.session_state.sources:
+                            sources_info += f"\n--- Source: {s['name']} (Coverage: {s['coverage']}) ---\n"
+                            sources_info += f"```csv\n{s['raw_data']}\n```\n"
+                        
                         ai_report = run_ai_diagnosis(prompt, context, sources_info)
                         
                         st.session_state.analysis_result = {
@@ -286,7 +296,6 @@ def view_workspace():
             st.caption(f"Generated: {res['date']} | Sources: {res['sources']}")
             st.divider()
             
-            # OpenAI가 마크다운으로 내려준 4가지 섹션을 그대로 출력
             st.markdown(res['report_content'])
 
 # ==========================================
