@@ -161,7 +161,6 @@ def prepare_data_for_ai(df):
             camp_summary['CPA'] = np.where(camp_summary[conv_col] > 0, (camp_summary[cost_col] / camp_summary[conv_col]).round(0), 0)
         if click_col and imp_col:
             camp_summary['CTR(%)'] = np.where(camp_summary[imp_col] > 0, ((camp_summary[click_col] / camp_summary[imp_col]) * 100).round(2), 0)
-        # 신규 추가: CVR (Conversion Rate) 자동 계산
         if conv_col and click_col:
             camp_summary['CVR(%)'] = np.where(camp_summary[click_col] > 0, ((camp_summary[conv_col] / camp_summary[click_col]) * 100).round(2), 0)
         if rev_col and cost_col:
@@ -192,27 +191,33 @@ def run_ai_diagnosis(prompt, context, sources_info):
     당신은 7년 차 탑티어 퍼포먼스 마케터(Performance Marketer)입니다.
     제공된 데이터(피벗 테이블)를 분석하여 광고주가 즉시 실행할 수 있는 '매체 최적화 액션플랜'을 도출해야 합니다.
 
+    [🚨 치명적 주의사항 - CPA 수학적 논리 (절대 틀리지 마세요)]
+    사용자가 제시한 목표 CPA(Target CPA)와 각 캠페인의 실제 CPA를 비교할 때, 반드시 아래 사고 과정을 거치세요:
+    1. 사용자의 타겟 CPA 숫자를 확인합니다. (예: 3000)
+    2. 캠페인의 실제 CPA 숫자를 확인합니다. (예: 139)
+    3. 139는 3000보다 작으므로 "목표 달성(매우 우수함, Scale-up 대상)"으로 판정합니다.
+    4. 반대로 4500은 3000보다 크므로 "목표 초과(비효율, OFF 대상)"로 판정합니다.
+    절대 숫자의 크기 비교를 반대로 해석하여 효율/비효율을 거꾸로 말하지 마세요.
+
     [핵심 퍼포먼스 마케팅 진단 로직]
-    1. **절대 룰 (CPA & ROAS):** CPA는 목표치보다 낮을수록 우수한 것이며, ROAS는 높을수록 우수합니다. CPA가 타겟보다 낮다면 무조건 칭찬하고 예산 증액(Scale-up)을 제안하세요.
+    1. **절대 룰 (ROAS):** ROAS(광고비용 대비 수익률)는 100%를 기준으로 높을수록 우수합니다. 
     2. **퍼넬 진단 (CTR vs CVR 분석):**
-       - [CTR은 높은데 CVR이 낮음]: 광고 소재(Creative)의 후킹은 좋으나, 랜딩 페이지 경험이 나쁘거나 과장 광고(Clickbait)일 확률이 높다고 진단하세요.
-       - [CTR은 낮으나 CVR이 높음]: 타겟팅이 너무 좁거나 소재 매력도가 떨어져 클릭을 못 받지만, 유입된 유저의 구매 의도는 좋다고 진단하세요. (소재 교체 제안)
-    3. **통계적 유의성 판단:** 클릭수가 100건 미만이거나 비용 소진이 미미한 캠페인은 "아직 모수가 부족하여 머신러닝 학습 중이므로 섣부른 판단 보류"라고 조언하세요.
-    4. **예산 낭비(Wasted Spend) 색출:** 모수가 충분함에도 전환(Conversions)이 없거나 CPA가 압도적으로 높은 캠페인을 반드시 집어내어 "즉시 OFF"를 권고하세요.
+       - [CTR은 높은데 CVR이 낮음]: 광고 소재(Creative)의 후킹은 좋으나 랜딩 페이지 경쟁력이 떨어지거나 과대광고일 확률이 높음.
+       - [CTR은 낮으나 CVR이 높음]: 타겟팅이 너무 좁거나 소재 매력도는 떨어지지만 상품 자체의 소구력은 좋음.
+    3. **예산 낭비(Wasted Spend) 색출:** 모수가 충분함에도 CPA가 타겟 CPA를 심각하게 초과하거나 전환이 0인 캠페인은 "즉시 OFF"를 권고하세요.
     
     [작성 규칙]
-    - 캠페인 이름을 정확히 명시하고 (예: 【KP】ACe_Demandgen), CPA/ROAS/CVR 등 괄호 안에 실제 수치를 넣어 설득력을 높이세요.
-    - '타겟팅 뎁스', '랜딩 페이지 최적화(LPO)', '머신러닝 안정화', '디마케팅' 등의 전문 용어를 구사하세요.
-    - 반드시 아래 4가지 H3(###) 마크다운 헤딩 구조를 지키고, 한국어(Korean)로만 출력하세요.
+    - 캠페인 이름을 정확히 명시하고, 분석 시 반드시 괄호 안에 실제 수치(CPA, ROAS, CVR 등)를 넣어 근거를 대세요.
+    - 한국어(Korean)로만 출력하고, 아래 4가지 H3(###) 마크다운 헤딩 구조를 반드시 지키세요.
 
     ### 1. Executive Summary (성과 현황 요약)
-    ### 2. Key Findings (캠페인별 세부 효율 진단 - 퍼넬 관점)
+    ### 2. Key Findings (캠페인별 세부 효율 진단 - 타겟 CPA 달성 여부 반드시 포함)
     ### 3. Root Causes (효율 상승/하락의 데이터적 원인 진단)
     ### 4. Priority Actions (마케터가 당장 실행해야 할 예산 최적화 액션)
     """
     
     user_message = f"""
-    [데이터 요약본 (캠페인별 & 시계열 - CVR 및 ROAS 포함됨)]
+    [데이터 요약본 (캠페인별 & 시계열)]
     {sources_info}
     
     [사용자 분석 요청]
@@ -224,13 +229,14 @@ def run_ai_diagnosis(prompt, context, sources_info):
     위 데이터를 바탕으로 실무 퍼포먼스 마케터의 관점에서 진단 리포트를 작성해 주세요.
     """
     
+    # Rate Limit 방지를 위해 gpt-4o-mini 사용, 수학적 논리 강화를 위해 temperature 0.2 적용
     response = llm_client.chat.completions.create(
         model="gpt-4o-mini", 
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        temperature=0.5
+        temperature=0.2 
     )
     return response.choices[0].message.content
 
@@ -350,7 +356,7 @@ def view_workspace():
             if s_col3.button("Trend Analysis", use_container_width=True): st.session_state.prompt_input = "Trend Analysis"
             
             prompt = st.text_area("Prompt", value=st.session_state.prompt_input, height=100)
-            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target CPA is 5000 JPY.")
+            context = st.text_input("Additional Context (Optional)", placeholder="e.g., Target CPA is 3000 JPY.")
             
             if st.button("Run Diagnosis", type="primary"):
                 if not proj_data["sources"]:
